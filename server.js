@@ -31,7 +31,7 @@ function startRoomServer(port = 8765) {
           clients: new Map(), // ws -> { id, pseudo, muted, kicked }
           hostId: null,
           nextId: 1,
-          settings: { hostOnlyControl: false, chatLocked: false },
+          settings: { hostOnlyControl: false, chatLocked: false, reactionsLocked: false },
           password: String(password || '')
         };
         rooms.set(name, room);
@@ -110,7 +110,13 @@ function startRoomServer(port = 8765) {
               text: String(msg.text || '').slice(0, 500)
             });
             break;
+          case 'typing':
+            if (me.muted) return;
+            if (room.settings.chatLocked && me.id !== room.hostId) return;
+            broadcast(room, { type: 'typing', from: me.pseudo }, ws);
+            break;
           case 'reaction': {
+            if (room.settings.reactionsLocked && me.id !== room.hostId) return;
             const emoji = String(msg.emoji || '').slice(0, 8);
             if (emoji) broadcast(room, { type: 'reaction', emoji, from: me.pseudo }, ws);
             break;
@@ -135,6 +141,7 @@ function startRoomServer(port = 8765) {
             if (me.id !== room.hostId) return;
             room.settings.hostOnlyControl = !!msg.hostOnlyControl;
             room.settings.chatLocked = !!msg.chatLocked;
+            room.settings.reactionsLocked = !!msg.reactionsLocked;
             broadcast(room, { type: 'settings', settings: room.settings });
             break;
           case 'kick': {
