@@ -30,6 +30,7 @@ function startRoomServer(port = 8765) {
         room = {
           clients: new Map(), // ws -> { id, pseudo, muted, kicked }
           hostId: null,
+          coHosts: new Set(), // ids promus par l'hôte (modération partagée)
           nextId: 1,
           settings: { hostOnlyControl: false, chatLocked: false, reactionsLocked: false },
           password: String(password || '')
@@ -37,6 +38,11 @@ function startRoomServer(port = 8765) {
         rooms.set(name, room);
       }
       return room;
+    }
+
+    // Hôte ou co-hôte = pouvoirs de modération
+    function isMod(room, id) {
+      return id === room.hostId || room.coHosts.has(id);
     }
 
     function broadcast(room, obj, exceptWs = null) {
@@ -50,7 +56,8 @@ function startRoomServer(port = 8765) {
       return [...room.clients.values()].map((c) => ({
         id: c.id,
         pseudo: c.pseudo,
-        muted: !!c.muted
+        muted: !!c.muted,
+        coHost: room.coHosts.has(c.id)
       }));
     }
 
@@ -103,7 +110,7 @@ function startRoomServer(port = 8765) {
         switch (msg.type) {
           case 'chat':
             if (me.muted) return;
-            if (room.settings.chatLocked && me.id !== room.hostId) return;
+            if (room.settings.chatLocked && !isMod(room, me.id)) return;
             broadcast(room, {
               type: 'chat',
               from: me.pseudo,
@@ -112,11 +119,11 @@ function startRoomServer(port = 8765) {
             break;
           case 'typing':
             if (me.muted) return;
-            if (room.settings.chatLocked && me.id !== room.hostId) return;
+            if (room.settings.chatLocked && !isMod(room, me.id)) return;
             broadcast(room, { type: 'typing', from: me.pseudo }, ws);
             break;
           case 'reaction': {
-            if (room.settings.reactionsLocked && me.id !== room.hostId) return;
+            if (room.settings.reactionsLocked && !isMod(room, me.id)) return;
             const emoji = String(msg.emoji || '').slice(0, 8);
             if (emoji) broadcast(room, { type: 'reaction', emoji, from: me.pseudo }, ws);
             break;
@@ -130,7 +137,7 @@ function startRoomServer(port = 8765) {
             broadcast(room, { type: 'accepted', from: me.pseudo });
             break;
           case 'video':
-            if (room.settings.hostOnlyControl && me.id !== room.hostId) return;
+            if (room.settings.hostOnlyControl && !isMod(room, me.id)) return;
             broadcast(
               room,
               { type: 'video', action: msg.action, time: msg.time, paused: msg.paused },
@@ -145,28 +152,47 @@ function startRoomServer(port = 8765) {
             broadcast(room, { type: 'settings', settings: room.settings });
             break;
           case 'kick': {
-            if (me.id !== room.hostId) return;
+            if (!isMod(room, me.id)) return;
             for (const [w, c] of room.clients) {
-              if (c.id === msg.targetId && c.id !== room.hostId) {
-                c.kicked = true;
-                broadcast(room, { type: 'info', text: `${c.pseudo} a été expulsé par l'hôte` }, w);
-                if (w.readyState === 1) w.send(JSON.stringify({ type: 'kicked' }));
-                w.close();
-              }
+              if (c.id !== msg.targetId || c.id === room.hostId) continue;
+              // Un co-hôte ne peut pas expulser un autre co-hôte
+              if (me.id !== room.hostId && room.coHosts.has(c.id)) continue;
+              c.kicked = true;
+              room.coHosts.delete(c.id);
+              broadcast(room, { type: 'info', text: `${c.pseudo} a été expulsé par ${me.pseudo}` }, w);
+              if (w.readyState === 1) w.send(JSON.stringify({ type: 'kicked' }));
+              w.close();
             }
             break;
           }
           case 'mute': {
+            if (!isMod(room, me.id)) return;
+            for (const c of room.clients.values()) {
+              if (c.id !== msg.targetId || c.id === room.hostId) continue;
+              // Un co-hôte ne peut pas muter un autre co-hôte
+              if (me.id !== room.hostId && room.coHosts.has(c.id)) continue;
+              c.muted = !!msg.muted;
+              broadcast(room, { type: 'roster', roster: roster(room), hostId: room.hostId });
+              broadcast(room, {
+                type: 'info',
+                text: `${c.pseudo} a été ${c.muted ? 'muté' : 'démuté'} par ${me.pseudo}`
+              });
+            }
+            break;
+          }
+          case 'cohost': {
             if (me.id !== room.hostId) return;
             for (const c of room.clients.values()) {
-              if (c.id === msg.targetId && c.id !== room.hostId) {
-                c.muted = !!msg.muted;
-                broadcast(room, { type: 'roster', roster: roster(room), hostId: room.hostId });
-                broadcast(room, {
-                  type: 'info',
-                  text: `${c.pseudo} a été ${c.muted ? 'muté' : 'démuté'} par l'hôte`
-                });
-              }
+              if (c.id !== msg.targetId || c.id === room.hostId) continue;
+              if (msg.value) room.coHosts.add(c.id);
+              else room.coHosts.delete(c.id);
+              broadcast(room, { type: 'roster', roster: roster(room), hostId: room.hostId });
+              broadcast(room, {
+                type: 'info',
+                text: msg.value
+                  ? `${c.pseudo} est maintenant co-hôte 🎖️`
+                  : `${c.pseudo} n'est plus co-hôte`
+              });
             }
             break;
           }
@@ -179,14 +205,19 @@ function startRoomServer(port = 8765) {
         const me = room.clients.get(ws);
         if (!me) return;
         room.clients.delete(ws);
+        room.coHosts.delete(me.id);
         if (room.clients.size === 0) {
           // Dernière personne partie : la room (et son mot de passe) disparaît
           rooms.delete(ws.roomName);
           return;
         }
-        // L'hôte part → le plus ancien participant restant devient hôte
+        // L'hôte part → un co-hôte hérite en priorité, sinon le plus ancien
         if (me.id === room.hostId) {
-          room.hostId = [...room.clients.values()][0].id;
+          const heir =
+            [...room.clients.values()].find((c) => room.coHosts.has(c.id)) ||
+            [...room.clients.values()][0];
+          room.hostId = heir.id;
+          room.coHosts.delete(heir.id);
         }
         broadcast(room, { type: 'roster', roster: roster(room), hostId: room.hostId });
         if (!me.kicked) {
